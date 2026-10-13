@@ -62,15 +62,18 @@ func TestParseCarrierRequestHeaderLimitsAndSmugglingRejection(t *testing.T) {
 		t.Fatalf("token-list upgrade = %#v, %v", tokenListUpgrade, err)
 	}
 	for name, connection := range map[string]string{
-		"empty option":      "keep-alive,,upgrade",
-		"duplicate option":  "upgrade, Upgrade",
-		"close and upgrade": "close, upgrade",
-		"unknown option":    "keep-alive, x-hop",
-		"upgrade no header": "upgrade",
+		"empty option":            "keep-alive,,upgrade",
+		"duplicate option":        "upgrade, Upgrade",
+		"duplicate close":         "close, Close, upgrade",
+		"close and keep-alive":    "close, keep-alive",
+		"unknown option":          "keep-alive, x-hop",
+		"partial upgrade":         "close, x-upgrade",
+		"upgrade no header":       "upgrade",
+		"close upgrade no header": "close, upgrade",
 	} {
 		t.Run("connection "+name, func(t *testing.T) {
 			raw := "GET /socket HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: " + connection + "\r\n"
-			if name != "upgrade no header" {
+			if !strings.HasSuffix(name, "no header") {
 				raw += "Upgrade: websocket\r\n"
 			}
 			raw += "\r\n"
@@ -95,6 +98,32 @@ func TestParseCarrierRequestHeaderLimitsAndSmugglingRejection(t *testing.T) {
 	large, _, err := parseCarrierRequestHeader([]byte(validPrefix + "Content-Length: 2097153\r\n\r\n"))
 	if err != nil || large.contentLength != maxCarrierBatchBytes+1 {
 		t.Fatalf("ordinary large Content-Length = %d, %v", large.contentLength, err)
+	}
+}
+
+func TestParseCarrierRequestHeaderCloseAndUpgrade(t *testing.T) {
+	for _, connection := range []string{
+		"close, upgrade",
+		"upgrade, close",
+		"ClOsE, UpGrAdE",
+		" \tclose\t,\tupgrade\t ",
+		"keep-alive, close, upgrade",
+	} {
+		t.Run(connection, func(t *testing.T) {
+			raw := "GET /socket HTTP/1.1\r\nHost: proxy.example.com\r\n" +
+				"Connection: " + connection + "\r\nUpgrade: websocket\r\n\r\n"
+			request, consumed, err := parseCarrierRequestHeader([]byte(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !request.upgrade || request.close || consumed != len(raw) {
+				t.Fatalf("parsed upgrade = %#v, consumed %d", request, consumed)
+			}
+		})
+	}
+	request, _, err := parseCarrierRequestHeader([]byte("GET / HTTP/1.1\r\nHost: proxy.example.com\r\nConnection: close\r\n\r\n"))
+	if err != nil || !request.close || request.upgrade {
+		t.Fatalf("ordinary close = %#v, %v", request, err)
 	}
 }
 

@@ -162,11 +162,12 @@ func parseConnectionHeader(value, upgrade string) (closeConnection, upgradeConne
 			return false, false, false
 		}
 	}
-	if closeSeen {
-		return true, false, !keepAlive && !upgradeSeen
-	}
 	if upgradeSeen {
+		// The upgraded protocol owns the connection lifetime, even with close.
 		return false, true, upgrade != ""
+	}
+	if closeSeen {
+		return true, false, !keepAlive
 	}
 	return false, false, keepAlive
 }

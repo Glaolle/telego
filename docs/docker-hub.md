@@ -13,10 +13,10 @@ The image uses `telego` as its entry point. It contains a static binary and no s
 
 ## Supported image tags
 
-Release `v0.6.9` publishes these tags:
+Release `v0.7.0` publishes these tags:
 
-- `scratchnet/telego:v0.6.9` — fixed release
-- `scratchnet/telego:v0.6` — latest `v0.6.x` release
+- `scratchnet/telego:v0.7.0` — fixed release
+- `scratchnet/telego:v0.7` — latest `v0.7.x` release
 - `scratchnet/telego:v0` — latest `v0.x` release
 - `scratchnet/telego:latest` — moving image from a release or a successful `main` build
 
@@ -24,14 +24,14 @@ The current manifests support Linux on AMD64, ARM64, and ARMv7.
 
 For repeatable deployments, use a fixed release tag. The `latest` tag can contain unreleased changes from `main`.
 
-## Changes in v0.6.9
+## Changes in v0.7.0
 
-This release adds a WEB credential prefilter and updates the dependencies and Go toolchain.
-Unknown credential prefixes no longer require a scan of every configured profile.
-Possible matches still require full constant-time credential comparisons.
+This release corrects WEB WebSocket handshakes with `Connection: close, upgrade`, including requests that lighttpd forwards.
+Both `websocket` and `websocket-lanes` now accept this token combination and retain the connection for WebSocket data.
+Ordinary HTTP requests with `Connection: close` retain their existing behavior.
 
-Existing v0.6.8 configuration and proxy links remain compatible.
-Read the [v0.6.9 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.6.9) for details.
+Existing configuration and proxy links remain compatible.
+Read the [v0.7.0 release notes](https://github.com/Scratch-net/telego/releases/tag/v0.7.0) for details.
 
 ## Upgrading from v0.6.7 or earlier
 
@@ -55,14 +55,14 @@ Read the [v0.6.8 release notes](https://github.com/Scratch-net/telego/releases/t
 Replace `www.google.com` with the FakeTLS mask hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.9 \
+docker run --rm scratchnet/telego:v0.7.0 \
   generate www.google.com
 ```
 
 To also print Telegram WEB proxy links, add the public WEB hostname:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.9 \
+docker run --rm scratchnet/telego:v0.7.0 \
   generate www.google.com --web-host proxy.example.com
 ```
 
@@ -93,7 +93,7 @@ docker run -d \
   --restart unless-stopped \
   -p 443:443 \
   -v "$PWD/config.toml:/config.toml:ro" \
-  scratchnet/telego:v0.6.9 \
+  scratchnet/telego:v0.7.0 \
   run -c /config.toml -l
 ```
 
@@ -108,7 +108,7 @@ docker logs telego
 ```yaml
 services:
   telego:
-    image: scratchnet/telego:v0.6.9
+    image: scratchnet/telego:v0.7.0
     restart: unless-stopped
     ports:
       - "443:443"
@@ -170,7 +170,7 @@ Replace `proxy.example.com` in these files:
 Generate the secret and WEB links:
 
 ```bash
-docker run --rm scratchnet/telego:v0.6.9 \
+docker run --rm scratchnet/telego:v0.7.0 \
   generate proxy.example.com --web-host proxy.example.com
 ```
 
@@ -213,7 +213,7 @@ Read the [complete WEB proxy guide](https://github.com/Scratch-net/telego/blob/m
 
 ## Update the container
 
-For a Compose installation, set the Telego image to `scratchnet/telego:v0.6.9` in the Compose file.
+For a Compose installation, set the Telego image to `scratchnet/telego:v0.7.0` in the Compose file.
 Then update the service:
 
 ```bash

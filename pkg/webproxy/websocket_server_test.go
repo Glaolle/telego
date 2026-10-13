@@ -76,6 +76,63 @@ func TestHTTPServerWebSocketMultiplexEndToEnd(t *testing.T) {
 	}
 }
 
+func TestHTTPServerWebSocketCloseAndUpgrade(t *testing.T) {
+	for _, carrier := range []CarrierMode{CarrierWebSocket, CarrierWebSocketLanes} {
+		t.Run(string(carrier), func(t *testing.T) {
+			application := newHTTPTestApplicationWithConfig(t, time.Second, func(config *ManagerConfig) {
+				config.Carrier = carrier
+			}, func(config *HTTPServerConfig) {
+				config.BasePath = "telega33"
+			})
+			created := createTestSession(t, application.manager, application.profiles[0])
+			protocol := webSocketProtocolPrefix + created.Token
+			if carrier == CarrierWebSocketLanes {
+				protocol = webSocketLaneProtocolPrefix + created.Token + ".1"
+			}
+			connection := dialHTTPTest(t, application.address)
+			defer connection.Close()
+			if err := connection.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			const key = "dGhlIHNhbXBsZSBub25jZQ=="
+			request := "GET /telega33/api/v1/ws HTTP/1.1\r\nHost: proxy.example.com\r\n" +
+				"Connection: close, upgrade\r\nUpgrade: websocket\r\n" +
+				"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + key + "\r\n" +
+				"Sec-WebSocket-Protocol: " + protocol + "\r\n\r\n"
+			if _, err := io.WriteString(connection, request); err != nil {
+				t.Fatal(err)
+			}
+			reader := bufio.NewReader(connection)
+			response, err := http.ReadResponse(reader, &http.Request{Method: http.MethodGet})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusSwitchingProtocols ||
+				response.Header.Get("Connection") != "Upgrade" ||
+				response.Header.Get("Upgrade") != "websocket" ||
+				response.Header.Get("Sec-WebSocket-Accept") != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" ||
+				response.Header.Get("Sec-WebSocket-Protocol") != protocol {
+				t.Fatalf("upgrade = %d, headers %#v", response.StatusCode, response.Header)
+			}
+			if err := connection.SetDeadline(time.Time{}); err != nil {
+				t.Fatal(err)
+			}
+			client := &webSocketTestClient{connection: connection, reader: reader}
+			payload := []byte("close, upgrade echo")
+			client.write(t, ws.OpBinary, true, testFrameBatch(t,
+				Frame{Type: FrameOpen, StreamID: 1},
+				Frame{Type: FrameData, StreamID: 1, Payload: payload},
+			))
+			for _, frame := range readWebSocketUntilData(t, client, 1, time.Second) {
+				if frame.Type == FrameData && frame.StreamID == 1 && bytes.Equal(frame.Payload, payload) {
+					return
+				}
+			}
+			t.Fatal("upgraded connection omitted echo DATA")
+		})
+	}
+}
+
 func TestHTTPServerWebSocketActiveConnectionMetricLifecycle(t *testing.T) {
 	for _, test := range []struct {
 		name     string
