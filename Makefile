@@ -29,6 +29,11 @@ ifneq ("$(wildcard $(MAKEFILE_DIR)/dist/rpmbuild.mk)","")
 include $(MAKEFILE_DIR)/dist/rpmbuild.mk
 endif
 
+# Creating an DEB distribution
+ifneq ("$(wildcard $(MAKEFILE_DIR)dist/debbuild.mk)","")
+include $(MAKEFILE_DIR)dist/debbuild.mk
+endif
+
 # Default target: build with all optimizations
 build:
 	CGO_ENABLED=0 go build -trimpath -tags="$(TAGS)" -ldflags="$(LDFLAGS)" -o $(BINARY) ./cmd/telego
@@ -124,7 +129,7 @@ build-linux-arm64:
 
 # Clean build artifacts
 clean:
-	rm -f $(BINARY) $(BINARY)-linux-*
+	rm -f $(BINARY) $(BINARY)-linux-* *.deb
 
 # Format and lint
 fmt:

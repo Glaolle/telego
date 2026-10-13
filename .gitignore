@@ -10,6 +10,7 @@ getProxySecret
 *.so
 *.dylib
 *.rpm
+*.deb
 /bin/
 /.config/
 
