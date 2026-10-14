@@ -33,7 +33,7 @@ jobs:
       - name: Collect Debian package
         run: |
           mkdir -p artifacts
-          cp ../*.deb artifacts/
+          cp *.deb artifacts/
 
       - name: Upload Debian package
         uses: actions/upload-artifact@v7
