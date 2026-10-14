@@ -1,0 +1,43 @@
+name: Build Debian Package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    name: Build .deb
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y devscripts build-essential debhelper
+
+      - name: Build Debian package
+        run: make deb
+
+      - name: Collect Debian package
+        run: |
+          mkdir -p artifacts
+          cp ../*.deb artifacts/
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: telego-deb
+          path: artifacts/*.deb
+          if-no-files-found: error
