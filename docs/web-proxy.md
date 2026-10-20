@@ -225,12 +225,12 @@ The `carrier` value selects one of these transports:
 
 | Value | Transport | Compatibility and use |
 |-------|-----------|-----------------------|
-| `https` | One serialized fetch and long-poll carrier | This value has the least Nginx requirements. It is the default when `carrier` is empty or absent. |
+| `https` | One fetch conveyor and long-poll carrier | This value has the least Nginx requirements. It is the default when `carrier` is empty or absent. |
 | `https-lanes` | One fetch and long-poll lane for each Telegram stream | Alternative for deployments without WebSocket support. Requires public HTTP/2. |
 | `websocket` | One multiplexed WebSocket for the WEB session | Installer default. Forward HTTP/1.1 `Upgrade` and `Connection` headers to Telego. |
 | `websocket-lanes` | One WebSocket for each Telegram stream | Separate stream queues, with additional connections and handshakes. Requires HTTP/1.1 upgrade forwarding. |
 
-If `carrier` is absent, Telego uses serialized `https`. Existing configurations keep their current behavior after an upgrade.
+If `carrier` is absent, Telego uses `https`. An upgrade preserves the configured carrier.
 
 Carrier selection is explicit. If a WebSocket connection fails, Telego does not switch to HTTPS.
 
@@ -262,7 +262,24 @@ Recovery responses have a 1 KiB limit and use `Cache-Control: no-store`.
 
 The WebSocket target is `wss://<WEB host>/api/v1/ws`. The bridge sends the bearer credential in `Sec-WebSocket-Protocol`.
 
-In `https` mode, the carrier uses serialized fetch requests and long polls. In `https-lanes` mode, it uses independent fetch and long-poll lanes.
+In `https` mode, the carrier uses fetch requests and long polls.
+In `https-lanes` mode, it uses independent fetch and long-poll lanes.
+
+HTTPS carriers permit four concurrent uplink batches for each lane.
+Telego applies these batches in sequence and accepts byte-identical retries without duplicate delivery.
+The bridge starts a new batch only after acknowledgments advance the complete sequence prefix.
+An older bridge keeps serialized requests. A server without the window advertisement also selects serialized requests.
+
+The bridge delivers complete downlink frames before the response body ends.
+It advances the downlink cursor only after the complete response passes all checks.
+After a network interruption, the bridge compares the replayed bytes with its retained prefix.
+It skips frames that it already delivered. A changed prefix or response cursor closes the carrier.
+
+The bridge has separate 32 MiB limits for queued uplink data and retained downlink replay buffers.
+These two limits permit 64 MiB of retained carrier data in total.
+Each active downlink reader also accepts one response chunk within the batch limit and copies one complete frame at a time.
+The frame copy cannot exceed 1 MiB plus its eight-byte header.
+Telego charges queued HTTP bodies and their application capacity against its session and process limits before it reads the bodies.
 
 Session creation, uplink, and downlink requests each have a 90-second budget for retries, headers, and the complete response body.
 The bridge limits response bytes during the read. Session creation requires exactly eight bytes.

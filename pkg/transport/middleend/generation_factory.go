@@ -225,11 +225,14 @@ func (*GnetGenerationFactory) String() string {
 // GoString redacts the snapshot, endpoint state, runtime, dialer, and limits.
 func (f *GnetGenerationFactory) GoString() string { return f.String() }
 
-// Build constructs one unstarted manager with LinksPerDC gnet links for every
+// Build constructs one unstarted manager with LinksPerDC physical slots for every
 // exact signed DC in the snapshot. Replicas start at consecutive round-robin
 // positions so multi-endpoint DCs receive deterministic endpoint diversity. TCP
-// and tuple failures fall through the complete IPv4-first endpoint list. A
-// failure closes every link already constructed; no partial generation escapes.
+// and tuple failures follow the IPv4-first endpoint list within a slot deadline.
+// The first replica of every DC precedes second replicas in the bounded worker
+// queue. A construction cutoff leaves time for bootstrap and admission probes.
+// Failed positions remain in the manager for independent repair. Complete
+// failure or caller cancellation closes every link already constructed.
 func (f *GnetGenerationFactory) Build(ctx context.Context) (*FixedBindingManager, error) {
 	if ctx == nil {
 		return nil, fmt.Errorf("%w: nil context", ErrInvalidGnetGenerationFactory)
@@ -243,14 +246,16 @@ func (f *GnetGenerationFactory) Build(ctx context.Context) (*FixedBindingManager
 	state := f.state
 	state.buildMu.Lock()
 	defer state.buildMu.Unlock()
+	constructContext, cancelConstruction := generationPreparationPhaseContext(ctx, initialGenerationConstructionTimeout, 3)
+	defer cancelConstruction()
 
 	dcIDs := state.snapshot.DCIDs()
 	totalSlots := len(dcIDs) * state.linksPerDC
 	results := make([]generationSlotResult, totalSlots)
 	jobs := make(chan generationSlotJob, totalSlots)
-	for dcIndex, dcID := range dcIDs {
-		cursor := state.next[dcID]
-		for replica := range state.linksPerDC {
+	for replica := range state.linksPerDC {
+		for dcIndex, dcID := range dcIDs {
+			cursor := state.next[dcID]
 			jobs <- generationSlotJob{
 				index:  dcIndex*state.linksPerDC + replica,
 				dcID:   dcID,
@@ -265,32 +270,62 @@ func (f *GnetGenerationFactory) Build(ctx context.Context) (*FixedBindingManager
 	for range workerCount {
 		workers.Go(func() {
 			for job := range jobs {
-				results[job.index] = state.buildSlot(ctx, job.dcID, job.cursor)
+				if cause := context.Cause(constructContext); cause != nil {
+					results[job.index].err = cause
+					continue
+				}
+				slotContext, cancel := context.WithTimeout(constructContext, slotReplacementPreparationTimeout)
+				results[job.index] = state.buildSlot(slotContext, job.dcID, job.cursor)
+				cancel()
 			}
 		})
 	}
 	workers.Wait()
 
+	var firstError error
+	constructed := 0
 	for index, result := range results {
 		if result.err == nil {
+			constructed++
 			continue
 		}
-		closeGenerationSlots(results)
 		dcID := dcIDs[index/state.linksPerDC]
 		replica := index%state.linksPerDC + 1
-		return nil, fmt.Errorf("%w: signed DC %d link %d: %w", ErrGnetGenerationDial, dcID, replica, result.err)
+		if firstError == nil {
+			firstError = fmt.Errorf("%w: signed DC %d link %d: %w", ErrGnetGenerationDial, dcID, replica, result.err)
+		}
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		closeGenerationSlots(results)
+		return nil, fmt.Errorf("%w: %w", ErrGnetGenerationDial, cause)
+	}
+	if constructed == 0 {
+		closeGenerationSlots(results)
+		return nil, firstError
 	}
 
 	slots := make([]FixedBindingSlot, len(results))
 	for index, result := range results {
 		slots[index] = result.slot
+		if result.err != nil {
+			slots[index] = FixedBindingSlot{
+				DCID: dcIDs[index/state.linksPerDC],
+				Link: newFailedGenerationLink(result.err),
+			}
+		}
 	}
 	manager, err := newFixedBindingManagerWithResponseBudget(slots, state.bindingLimits, state.buildReplacementLink, state.responseBudget)
 	if err != nil {
 		closeGenerationSlots(results)
 		return nil, fmt.Errorf("construct Middle-End generation manager: %w", err)
 	}
+	// Only the production factory opts into partial admission. Standalone
+	// constructors retain their strict startup and nil-link validation.
+	manager.state.partialStartup = true
 	for index, result := range results {
+		if result.err != nil {
+			continue
+		}
 		dcID := dcIDs[index/state.linksPerDC]
 		state.advanceCursor(dcID, result.selected)
 	}
@@ -350,6 +385,9 @@ func (s *gnetGenerationFactoryState) buildSlot(ctx context.Context, dcID DCID, c
 	candidates := generationEndpointOrder(s.snapshot.Endpoints(dcID), cursor)
 	var lastErr error
 	for _, candidate := range candidates {
+		if cause := context.Cause(ctx); cause != nil {
+			return generationSlotResult{err: cause}
+		}
 		conn, serverAddr, clientAddr, err := s.dialer.Dial(ctx, candidate.endpoint, s.endpointDialTimeout)
 		if err != nil {
 			lastErr = err
@@ -358,6 +396,10 @@ func (s *gnetGenerationFactoryState) buildSlot(ctx context.Context, dcID DCID, c
 		if conn == nil {
 			lastErr = errors.New("dialer returned a nil TCP connection")
 			continue
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			_ = conn.Close()
+			return generationSlotResult{err: cause}
 		}
 
 		now := s.now()

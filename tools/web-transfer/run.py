@@ -334,7 +334,23 @@ class BrowserBridge:
             await self.runner.cleanup()
 
 
+def load_payload(mib, payload_file=None):
+    if not 1 <= mib <= 64:
+        raise ValueError('payload size must be 1..64 MiB')
+    size = mib << 20
+    if payload_file is None:
+        return secrets.token_bytes(size)
+    if not payload_file.is_file() or payload_file.stat().st_size != size:
+        raise ValueError('payload file size must match --mib')
+    with payload_file.open('rb') as source:
+        payload = source.read(size + 1)
+    if len(payload) != size:
+        raise ValueError('payload file changed size')
+    return payload
+
+
 async def transfer(args, endpoint, credentials, result):
+    payload = load_payload(args.mib, args.payload_file)
     use_native_ctr()
     bridge = BrowserBridge(endpoint)
     result['bridge'] = bridge.stats
@@ -360,7 +376,6 @@ async def transfer(args, endpoint, credentials, result):
             if user.id != admin:
                 raise ValueError('admin mismatch')
             peer = types.InputPeerUser(user.id, user.access_hash or 0)
-            payload = secrets.token_bytes(args.mib << 20)
             expected = hashlib.sha256(payload).hexdigest()
             name = 'telego-web-transfer-check.bin'
             result['stage'] = 'upload'
@@ -401,6 +416,7 @@ def main():
     parser.add_argument('--endpoint', type=Path, required=True, help='Private endpoint JSON from export_endpoint.py')
     parser.add_argument('--state-dir', type=Path, default=STATE)
     parser.add_argument('--mib', type=int, choices=range(1, 65), default=1, metavar='1..64')
+    parser.add_argument('--payload-file', type=Path, help='Reuse an exact --mib-sized payload file')
     parser.add_argument('--timeout', type=int, choices=range(30, 301), default=120, metavar='30..300')
     parser.add_argument('--send', action='store_true', help='Send the verified document to the configured admin')
     args = parser.parse_args()

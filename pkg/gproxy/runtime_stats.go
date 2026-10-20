@@ -72,6 +72,8 @@ func handshakeStageForState(state ConnState) handshakeFailureStage {
 		return handshakeFailureProxyProtocol
 	case StateReadTLSHeader, StateReadTLSPayload:
 		return handshakeFailureTLSClientHello
+	case StateWriteServerHello:
+		return handshakeFailureTLSServerHello
 	case StateReadO2Frame:
 		return handshakeFailureTLSMTProto
 	case StateReadDDFrame:

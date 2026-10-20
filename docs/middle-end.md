@@ -114,7 +114,11 @@ Telegram reconnects a client after its selected physical link fails. The new TCP
 
 ## Link topology
 
-Telego keeps one active generation. This generation has four gnet links for each signed DC in Telegram's current artifacts.
+Telego keeps one active generation. This generation has four physical slots for each signed DC in Telegram's current artifacts.
+
+A generation can start with fewer ready links. Telego admits only links that complete the handshake and return a matching RPC pong.
+
+An unavailable signed DC uses direct fallback. Failed slots retain their identities and recover independently without a new generation.
 
 The pool selects a least-loaded healthy link for each new binding. The binding stays on that physical link until the binding closes.
 
@@ -130,7 +134,11 @@ If the artifacts return to the applied content, Telego restores that content as 
 
 If artifact content changes, Telego prepares and probes one candidate generation. The active generation continues to accept bindings during this work.
 
-After a successful probe, Telego publishes the candidate in one operation. New bindings use this active generation.
+After admission probes, Telego publishes the candidate in one operation. New bindings use this active generation.
+
+For each desired signed DC, the candidate must preserve the active generation's ready coverage. A candidate can omit coverage only for unavailable or removed DCs.
+
+If the candidate loses ready coverage for a desired DC, Telego rejects it. The active generation keeps its admission and existing bindings.
 
 The previous generation accepts no new bindings. Its healthy links keep their existing bindings and independent probes without a retirement deadline.
 
@@ -180,6 +188,14 @@ Bindings on the failed slot close. Bindings on other slots and other DC pools st
 
 Each replacement has 10s to complete preparation, including the handshake and a matching RPC pong. Only then can new bindings use the repaired slot.
 
+Each initial slot construction, handshake, and admission probe has at most 10s. A failed slot does not prevent healthy slots from admission.
+
+The construction queue places every DC's first slot before its extra replicas. Initial construction has a 70s ceiling.
+
+The construction deadline reserves time for handshakes, admission probes, and publication. Shorter generation deadlines also reduce the later phase budgets.
+
+A construction timeout preserves completed links for admission. Caller cancellation, caller expiry, or shutdown closes the candidate.
+
 Failed replacements use bounded retries with positive jitter. Each failed slot permits one repair attempt at a time.
 
 A manager-wide failure removes ME admission. New connections use direct fallback while Telego builds a new active generation.
@@ -206,7 +222,8 @@ Telego derives the operational limits below. Most installations do not need an o
 | NAT probe timeout | 5s | One shared STUN batch for private direct sockets |
 | NAT result cache | 10 minutes | Matches the public telemt cache period |
 | NAT proactive refresh | 5 minutes after success | Does not depend on client traffic |
-| Generation preparation timeout | 100s | Covers construction, startup, and the first all-DC probe |
+| Generation preparation timeout | 100s | Covers construction, startup, and initial admission probes |
+| Initial construction timeout | At most 70s | Reserves time for startup, admission probes, and publication within the generation deadline |
 | Live generation managers | 2 | Includes an unpublished candidate and managers with unfinished cleanup |
 | Retiring generation deadline | None | Healthy bindings remain until natural closure, failure, capacity retirement, or shutdown |
 

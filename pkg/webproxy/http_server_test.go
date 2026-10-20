@@ -38,6 +38,7 @@ func TestHTTPServerRouteSessionEndToEnd(t *testing.T) {
 	welcome := readHTTPBody(t, createResponse)
 	if createResponse.StatusCode != 200 || createResponse.Header.Get("X-Carrier-Mode") != "https" ||
 		createResponse.Header.Get("X-Down-Cursor") != "0" ||
+		createResponse.Header.Get("X-Up-Window") != "4" ||
 		!bytes.Equal(welcome, testFrameBatch(t, Frame{Type: FrameWelcome})) {
 		t.Fatalf("create response = %d %#v %x", createResponse.StatusCode, createResponse.Header, welcome)
 	}

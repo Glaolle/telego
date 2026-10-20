@@ -68,6 +68,30 @@ It does not use or change the VKDL session.
 Run one process per state directory.
 
 For a larger transfer, add `--mib 8` (maximum 64).
+For matched carrier trials, add `--payload-file` with the same file on every run.
+The file must contain exactly the number of MiB selected by `--mib`.
+The harness rejects empty files, mismatched sizes, and values outside 1–64 MiB before it opens the browser.
+
+Create one private 8 MiB fixture:
+
+```sh
+rtk proxy python3 -c 'from pathlib import Path; import secrets; p=Path(".local/web-transfer/matched-8m.bin"); p.parent.mkdir(parents=True, exist_ok=True); p.write_bytes(secrets.token_bytes(8 << 20)); p.chmod(0o600)'
+```
+
+Run the same fixture against each private endpoint with a separate state directory:
+
+```sh
+rtk proxy env PLAYWRIGHT_BROWSERS_PATH=/path/to/playwright/browsers \
+  .local/web-transfer/venv/bin/python tools/web-transfer/run.py \
+  --credentials /path/to/vkdl/config.toml \
+  --endpoint .local/web-transfer/https-endpoint.json \
+  --state-dir .local/web-transfer/https-state \
+  --mib 8 --payload-file .local/web-transfer/matched-8m.bin
+```
+
+For the WebSocket run, select its endpoint and state directory with the same fixture and size.
+The default run still creates random data.
+
 For a visible bot message, add `--send`.
 This flag sends the verified file to the configured admin after the download succeeds.
 The default run does not send a message.
@@ -90,3 +114,9 @@ They do not measure desktop ping or establish a throughput comparison between ca
 
 The browser ignores explicit HTTP proxy settings.
 The host network can still pass traffic through a VPN or TUN interface.
+
+## Utility tests
+
+```sh
+rtk proxy .local/web-transfer/venv/bin/python -m unittest discover -s tools/web-transfer -p 'test_*.py'
+```

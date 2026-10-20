@@ -91,6 +91,9 @@ middle-end.enabled = true
 		{"tls-fronting.splice-port", "-1"},
 		{"tls-fronting.splice-port", "65536"},
 		{"tls-fronting.fake-cert-size", "-1"},
+		{"tls-fronting.server-hello-segment-size", "-1"},
+		{"tls-fronting.server-hello-segment-size", "63"},
+		{"tls-fronting.server-hello-segment-size", "1461"},
 		{"tls-fronting.splice-proxy-protocol", "-1"},
 		{"tls-fronting.splice-proxy-protocol", "3"},
 		{"tls-fronting.splice-idle-timeout", `"-1s"`},
@@ -122,6 +125,20 @@ middle-end.enabled = true
 				t.Errorf("ToGProxyConfig error = %v, want rejection naming %s", err, test.key)
 			}
 		})
+	}
+}
+
+func TestConfigServerHelloSegmentSize(t *testing.T) {
+	for _, size := range []int{0, 64, 92, 1460} {
+		content := fmt.Sprintf("secrets.test = %q\ntls-fronting.mask-host = %q\ntls-fronting.server-hello-segment-size = %d\n", "0123456789abcdef0123456789abcdef", "example.com", size)
+		file, err := Load(writeConfigTestFile(t, content))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := file.ToGProxyConfig()
+		if err != nil || cfg.ServerHelloSegmentSize != size {
+			t.Fatalf("size=%d cfg=%d error=%v", size, cfg.ServerHelloSegmentSize, err)
+		}
 	}
 }
 

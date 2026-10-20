@@ -51,6 +51,7 @@ function deliver(data){
  lastActivity=Date.now();port.postMessage({t:'traffic',up:0,down:data.byteLength});port.postMessage(data,[data]);
 }
 function retireCarrier(){
+ resetHTTPS();
  epoch++;epochController.abort();epochController=new AbortController();
  if(pollController)pollController.abort();pollController=null;
  for(const lane of lanes.values()){

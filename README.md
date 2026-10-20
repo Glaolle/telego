@@ -113,7 +113,7 @@ Read the [managed gateway guide](examples/gateway/README.md) for updates, backup
 
 ### From Source
 
-Source builds require Go 1.27.2 or later and the complete repository, including `third_party/gnet`.
+Source builds require Go 1.27.3 or later and the complete repository, including `third_party/gnet`.
 
 ```bash
 git clone https://github.com/Scratch-net/telego.git
@@ -443,7 +443,12 @@ telego generate <mask-host> [--web-host <hostname>] [--web-base-path <path>]
   --web-base-path <path>     Bind WEB links to a path; requires --web-host
 
 telego version   Show version information
+
+telego doctor -c <config> [--timeout 10s] [--cert-source]
+                             Verify the fallback TLS certificate and mask hostname
 ```
+
+See [TLS compatibility and diagnostics](docs/tls-fronting.md) for fragmented ClientHello support and optional Linux ServerHello segmentation.
 
 ---
 
@@ -799,6 +804,8 @@ Unauthenticated FakeTLS probes ─────────────▶ mask h
 ---
 
 ## Contributing
+
+Use the [release checklist](docs/releasing.md) for dependency updates, candidate testing, and release promotion.
 
 Before a pull request, run `make test`.
 This command runs the local gnet patch regressions and the Telego tests in the three supported build modes.

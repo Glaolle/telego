@@ -115,7 +115,7 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 	hello.SessionID = make([]byte, sessionIDLen)
 	copy(hello.SessionID, payload[clientHelloSessionIDOffset+1:])
 
-	// Extract cipher suite (first one from the list)
+	// Select the first non-GREASE cipher suite.
 	hello.CipherSuite = extractCipherSuite(payload, sessionIDLen)
 
 	// Extract SNI hostname from extensions
@@ -132,15 +132,26 @@ func ParseClientHello(secret []byte, payload []byte) (*ClientHello, error) {
 	return hello, nil
 }
 
-// extractCipherSuite extracts the first cipher suite from ClientHello.
+// extractCipherSuite selects the first non-GREASE suite in the declared vector.
 func extractCipherSuite(payload []byte, sessionIDLen int) uint16 {
 	// Cipher suites start after: handshake_header(4) + version(2) + random(32) + session_id_len(1) + session_id
 	offset := 4 + 2 + 32 + 1 + sessionIDLen
-	if offset+4 > len(payload) {
+	if sessionIDLen < 0 || offset < 0 || offset+2 > len(payload) {
 		return 0
 	}
-	// Skip cipher suites length (2 bytes), read first cipher suite
-	return binary.BigEndian.Uint16(payload[offset+2 : offset+4])
+	length := int(binary.BigEndian.Uint16(payload[offset : offset+2]))
+	offset += 2
+	if length%2 != 0 || length > len(payload)-offset {
+		return 0
+	}
+	for end := offset + length; offset < end; offset += 2 {
+		suite := binary.BigEndian.Uint16(payload[offset : offset+2])
+		// RFC 8701 reserves only the sixteen equal-byte values 0x?a?a.
+		if byte(suite>>8) != byte(suite) || suite&0x0f0f != 0x0a0a {
+			return suite
+		}
+	}
+	return 0
 }
 
 // bootTimeThreshold is the maximum timestamp considered as "boot time" (uptime).

@@ -289,6 +289,9 @@ type fixedBindingManager struct {
 	reclaimDone    chan struct{}
 	reclaimClosing bool
 	state          fixedBindingManagerState
+	// Immutable after construction; only the production repair-capable
+	// generation factory enables partial startup and initial admission.
+	partialStartup bool
 	// slots retains the first configured slot for focused diagnostics and
 	// compatibility with single-link generations. slotGroups owns the complete
 	// per-DC pool used for admission and probing.
@@ -890,17 +893,26 @@ func (m *fixedBindingManager) startFirst(ctx context.Context) error {
 	m.ensureConsumers()
 	m.mu.Lock()
 	starting := m.state == fixedBindingManagerStarting
-	var sinkErr error
+	sinkErrors := make([]error, len(m.order))
 	if starting {
-		for _, slot := range m.order {
+		for index, slot := range m.order {
 			if err := m.installResponseSinkLocked(slot, slot.link, slot.events); err != nil {
-				sinkErr = fmt.Errorf("%w: DC %d response sink: %w", ErrFixedBindingInitialFailure, slot.dcID, err)
-				break
+				sinkErrors[index] = fmt.Errorf("%w: DC %d response sink: %w", ErrFixedBindingInitialFailure, slot.dcID, err)
+				if !m.partialStartup {
+					break
+				}
 			}
 		}
 	}
 	m.mu.Unlock()
-	if sinkErr != nil {
+	for index, sinkErr := range sinkErrors {
+		if sinkErr == nil {
+			continue
+		}
+		if m.partialStartup {
+			m.failSlot(m.order[index], sinkErr, FixedBindingSlotFailureLinkTerminal)
+			continue
+		}
 		m.beginTerminal(sinkErr)
 		<-m.done
 		return m.waitStartResult()
@@ -913,13 +925,21 @@ func (m *fixedBindingManager) startFirst(ctx context.Context) error {
 	results := make([]error, len(m.order))
 	var starts sync.WaitGroup
 	for index, slot := range m.order {
+		if sinkErrors[index] != nil {
+			results[index] = sinkErrors[index]
+			continue
+		}
 		starts.Go(func() {
-			results[index] = slot.link.Start(ctx)
+			results[index] = m.startInitialSlot(ctx, slot)
 		})
 	}
 	starts.Wait()
 	for index, err := range results {
 		if err == nil {
+			continue
+		}
+		if m.partialStartup {
+			m.failSlot(m.order[index], err, FixedBindingSlotFailureLinkTerminal)
 			continue
 		}
 		m.beginTerminal(fmt.Errorf("%w: DC %d: %w", ErrFixedBindingInitialFailure, m.order[index].dcID, err))
@@ -928,6 +948,18 @@ func (m *fixedBindingManager) startFirst(ctx context.Context) error {
 	}
 
 	m.mu.Lock()
+	if m.partialStartup && m.state == fixedBindingManagerStarting {
+		cause := context.Cause(ctx)
+		if cause == nil && len(m.readyCoverageLocked()) == 0 {
+			cause = firstSlotFailure(m.order)
+		}
+		if cause != nil {
+			m.mu.Unlock()
+			m.beginTerminal(fmt.Errorf("%w: %w", ErrFixedBindingInitialFailure, cause))
+			<-m.done
+			return m.waitStartResult()
+		}
+	}
 	if m.state == fixedBindingManagerStarting {
 		m.state = fixedBindingManagerReady
 		for index, slot := range m.order {
@@ -1075,16 +1107,26 @@ func (m *FixedBindingManager) quiesceWithRole(role GenerationRole) <-chan struct
 		return closed
 	}
 	m.state.mu.Lock()
-	m.state.accepting = false
-	if role != "" {
-		m.state.generationRole = role
-	}
-	m.state.cancelRepairs(ErrFixedBindingManagerQuiesced)
-	m.state.cancelRefreshes(ErrFixedBindingManagerQuiesced)
-	m.state.publishDrainedLocked()
+	m.state.quiesceLocked(role)
 	drained := m.state.drained
 	m.state.mu.Unlock()
+	m.state.cancelMaintenance()
 	return drained
+}
+
+// Publication can hold two manager locks. This mutation never invokes a
+// callback or cancels work; cancellation follows after both locks are released.
+func (m *fixedBindingManager) quiesceLocked(role GenerationRole) {
+	m.accepting = false
+	if role != "" {
+		m.generationRole = role
+	}
+	m.publishDrainedLocked()
+}
+
+func (m *fixedBindingManager) cancelMaintenance() {
+	m.cancelRepairs(ErrFixedBindingManagerQuiesced)
+	m.cancelRefreshes(ErrFixedBindingManagerQuiesced)
 }
 
 // Bind creates a positive process-unique connection identity fixed to one
@@ -3694,7 +3736,7 @@ func (m *fixedBindingManager) recordSlotFailureForProbe(
 	if dcObserver != nil && dcChange.ZeroReadyTransitions != 0 {
 		dcObserver(dcChange)
 	}
-	if starting {
+	if starting && !m.partialStartup {
 		m.beginTerminal(fmt.Errorf("%w: %w", ErrFixedBindingInitialFailure, wrapped))
 		return
 	}

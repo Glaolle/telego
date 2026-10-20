@@ -207,8 +207,13 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 		return gnet.None
 	}
 
-	// Extract payload (skip 5-byte header)
-	payload := data[faketls.RecordHeaderSize:needed]
+	payload, needed, ready, err := clientHelloPayload(data)
+	if err != nil {
+		return h.startSplice(c, ctx)
+	}
+	if !ready {
+		return gnet.None
+	}
 
 	// Try each secret until one matches
 	var hello *faketls.ClientHello
@@ -328,7 +333,6 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 
 	// Build ServerHello response
 	var response []byte
-	var err error
 
 	// HYBRID MODE: Use real ServerHello from mask host (best DPI evasion)
 	if h.serverHelloFetcher != nil {
@@ -379,6 +383,16 @@ func (h *ProxyHandler) handleTLSPayload(c clientEndpoint, ctx *ConnContext) gnet
 		}
 	}
 
+	if serverHelloPacingSupported && h.config.ServerHelloSegmentSize != 0 {
+		if conn, ok := c.(gnet.Conn); ok {
+			if _, tcp := conn.RemoteAddr().(*net.TCPAddr); tcp {
+				_, _, internalWEB := ctx.trustedProxyTuple()
+				if !internalWEB {
+					return h.startServerHelloPacing(conn, ctx, response)
+				}
+			}
+		}
+	}
 	// Send ServerHello - Write() is safe here since we're in EventHandler
 	if written, err := c.Write(response); err != nil || written != len(response) {
 		return h.failHandshake(ctx, handshakeFailureTLSServerHello)

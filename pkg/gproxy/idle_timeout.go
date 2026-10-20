@@ -111,6 +111,9 @@ func (ctx *ConnContext) stopHandshakeTimer() {
 
 func (ctx *ConnContext) stopConnectionTimers() {
 	ctx.stopHandshakeTimer()
+	if pacer := ctx.helloPacer.Swap(nil); pacer != nil {
+		pacer.stop()
+	}
 	if timer := ctx.authenticatedIdle.Swap(nil); timer != nil {
 		timer.mu.Lock()
 		timer.closed = true
