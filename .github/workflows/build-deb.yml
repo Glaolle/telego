@@ -3,7 +3,7 @@ name: Build Debian Package
 on:
   push:
     tags:
-      - "v*.*.*"
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -34,7 +34,9 @@ jobs:
         run: make deb
 
       - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          files: *.deb
+          files: |
+            *.deb
