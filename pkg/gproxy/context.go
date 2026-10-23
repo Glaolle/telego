@@ -20,17 +20,18 @@ import (
 type ConnState int32
 
 const (
-	StateDetectProtocol ConnState = iota // Detect ee vs dd protocol from first bytes
-	StateReadProxyProto                  // Need PROXY protocol header (optional)
-	StateReadTLSHeader                   // Need 5 bytes for TLS record header
-	StateReadTLSPayload                  // Need header.length bytes for payload
-	StateReadO2Frame                     // Need 64 bytes for obfuscated2 frame (TLS-wrapped)
-	StateReadDDFrame                     // Need 64 bytes for raw obfuscated2 frame (DD mode)
-	StateDialingDC                       // Async dial in progress
-	StateRelaying                        // Bidirectional relay active
-	StateSplicing                        // Forward to mask host (invalid client)
-	StateClosed                          // Connection is closing
-	StateMiddleEnd                       // Authenticated client routed through Middle-End
+	StateDetectProtocol   ConnState = iota // Detect ee vs dd protocol from first bytes
+	StateReadProxyProto                    // Need PROXY protocol header (optional)
+	StateReadTLSHeader                     // Need 5 bytes for TLS record header
+	StateReadTLSPayload                    // Need header.length bytes for payload
+	StateReadO2Frame                       // Need 64 bytes for obfuscated2 frame (TLS-wrapped)
+	StateReadDDFrame                       // Need 64 bytes for raw obfuscated2 frame (DD mode)
+	StateDialingDC                         // Async dial in progress
+	StateRelaying                          // Bidirectional relay active
+	StateSplicing                          // Forward to mask host (invalid client)
+	StateClosed                            // Connection is closing
+	StateMiddleEnd                         // Authenticated client routed through Middle-End
+	StateWriteServerHello                  // Optional paced TCP response before O2 admission
 )
 
 // ProtocolMode indicates the MTProxy protocol variant.
@@ -66,6 +67,8 @@ func (s ConnState) String() string {
 		return "Closed"
 	case StateMiddleEnd:
 		return "MiddleEnd"
+	case StateWriteServerHello:
+		return "WriteServerHello"
 	default:
 		return "Unknown"
 	}
@@ -111,6 +114,7 @@ type ConnContext struct {
 	// TLS handshake state (protected by mu)
 	tlsPayloadLen int                  // Expected payload length from TLS header
 	clientHello   *faketls.ClientHello // Parsed ClientHello
+	helloPacer    atomic.Pointer[serverHelloPacer]
 
 	// Matched secret (protected by mu during handshake, immutable after)
 	secret *Secret

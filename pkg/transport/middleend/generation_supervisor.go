@@ -21,13 +21,13 @@ var (
 	// ErrGenerationChanged reports a rotation superseded by a concurrent
 	// liveness transition.
 	ErrGenerationChanged = errors.New("Middle-End generation changed during rotation")
-	// ErrGenerationProbe reports a failed all-DC admission or liveness probe.
+	// ErrGenerationProbe reports a failed admission or liveness probe.
 	ErrGenerationProbe = errors.New("Middle-End generation probe failed")
 )
 
 // GenerationSupervisorConfig contains every operational duration used by the
 // supervisor. It has no defaults. PreparationTimeout bounds factory, manager
-// startup, and initial all-DC probing. ProbeInterval and ProbeFailureTimeout
+// startup, and initial admission probing. ProbeInterval and ProbeFailureTimeout
 // control admitted-generation liveness. Retirement has no time deadline.
 // RepairBackoffInitial and
 // RepairBackoffMaximum bound exponential repair delays. Each delay adds up to
@@ -210,7 +210,7 @@ func (*FixedBindingGenerationSupervisor) String() string {
 // GoString redacts managers, factories, and liveness state.
 func (s *FixedBindingGenerationSupervisor) GoString() string { return s.String() }
 
-// Start prepares one complete active generation. Calls are serialized. If
+// Start prepares one active generation. Calls are serialized. If
 // preparation fails, Bind remains unavailable and a bounded background repair
 // loop continues with the same factory.
 func (s *FixedBindingGenerationSupervisor) Start(ctx context.Context, factory FixedBindingGenerationFactory) error {
@@ -438,6 +438,10 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 		manager:  manager,
 		liveStop: make(chan struct{}),
 	}
+	if cause := generationPreparationCause(prepareContext, s.rootContext); cause != nil {
+		s.closeGeneration(generation)
+		return nil, fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
+	}
 	s.mu.Lock()
 	s.nextGenerationID++
 	generationID := s.nextGenerationID
@@ -471,6 +475,10 @@ func (s *generationSupervisorState) prepareGeneration(parent context.Context, fa
 	if err := s.probeGeneration(prepareContext, generation, s.config.ProbeFailureTimeout); err != nil {
 		s.closeGeneration(generation)
 		return nil, err
+	}
+	if cause := generationPreparationCause(prepareContext, s.rootContext); cause != nil {
+		s.closeGeneration(generation)
+		return nil, fmt.Errorf("%w: %w", ErrGenerationUnavailable, cause)
 	}
 	return generation, nil
 }
@@ -538,21 +546,55 @@ func (s *generationSupervisorState) addSourceLocked(generation *supervisedGenera
 	s.sources = append(s.sources, generation)
 }
 
-// publishGenerationLocked holds supervisor.mu on entry. Manager callbacks
-// acquire supervisor.mu only after releasing manager.mu. Candidate admission
-// is checked under its lock. That lock is released before quiescing the old
-// manager, and the retiring role becomes visible only after quiescence.
+// publishGenerationLocked holds supervisor.mu on entry. The lock order is
+// supervisor, predecessor manager, candidate manager. No other path acquires
+// two manager locks. Manager observers run only after releasing manager.mu.
+// Coverage checking and predecessor quiescence share this critical section,
+// so a concurrent repair cannot restore coverage that publication overlooks.
 func (s *generationSupervisorState) publishGenerationLocked(candidate, retiring *supervisedGeneration) bool {
 	m := candidate.manager.state
+	var predecessor *fixedBindingManager
+	rotating := retiring != nil && retiring == s.active
+	if retiring != nil {
+		predecessor = retiring.manager.state
+		if predecessor == m {
+			return false
+		}
+		predecessor.mu.Lock()
+	}
 	m.mu.Lock()
-	if m.state != fixedBindingManagerReady || !m.accepting {
+	unlock := func() {
 		m.mu.Unlock()
+		if predecessor != nil {
+			predecessor.mu.Unlock()
+		}
+	}
+	if m.state != fixedBindingManagerReady || !m.accepting ||
+		rotating && (predecessor.state != fixedBindingManagerReady || !predecessor.accepting ||
+			retiring.failed.Load() || retiring.intentional.Load()) {
+		unlock()
 		return false
 	}
-	for _, dcID := range candidate.dcIDs {
-		if m.readySlotsLocked(dcID) == 0 {
-			m.mu.Unlock()
-			return false
+	coverage := m.readyCoverageLocked()
+	if len(coverage) == 0 {
+		unlock()
+		return false
+	}
+	if !m.partialStartup {
+		for _, dcID := range candidate.dcIDs {
+			if _, ready := coverage[dcID]; !ready {
+				unlock()
+				return false
+			}
+		}
+	}
+	if rotating {
+		for dcID := range predecessor.readyCoverageLocked() {
+			_, desired := m.slotGroups[dcID]
+			if _, ready := coverage[dcID]; desired && !ready {
+				unlock()
+				return false
+			}
 		}
 	}
 	m.coverageEnabled = true
@@ -561,14 +603,17 @@ func (s *generationSupervisorState) publishGenerationLocked(candidate, retiring 
 	s.lastPlan = candidate.plan
 	s.addSourceLocked(candidate)
 	m.mu.Unlock()
-	// Supervisor readers and binding admission remain excluded throughout.
-	// Never hold two manager locks, and never expose a retiree that can still
-	// claim or publish a replacement. A rejected candidate changes neither.
-	if retiring != nil {
-		retiring.manager.quiesceWithRole(GenerationRoleRetiring)
+	if predecessor != nil {
+		// Candidate admission is published while predecessor mutation remains
+		// excluded. Cancellation and cleanup never run under manager locks.
+		predecessor.quiesceLocked(GenerationRoleRetiring)
 		retiring.intentional.Store(true)
 	}
 	s.retiring = retiring
+	if predecessor != nil {
+		predecessor.mu.Unlock()
+		predecessor.cancelMaintenance()
+	}
 	return true
 }
 
@@ -735,6 +780,9 @@ func (s *generationSupervisorState) watchGenerationSlot(ctx context.Context, gen
 }
 
 func (s *generationSupervisorState) probeGeneration(parent context.Context, generation *supervisedGeneration, timeout time.Duration) error {
+	if generation.manager.state.partialStartup {
+		return s.probePartialGeneration(parent, generation, timeout)
+	}
 	probeContext, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	errorsByDC := make([]error, len(generation.dcIDs))

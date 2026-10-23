@@ -472,7 +472,7 @@ func TestGnetGenerationFactoryBoundsDialConcurrency(t *testing.T) {
 	}
 }
 
-func TestGnetGenerationFactoryClosesPartialGeneration(t *testing.T) {
+func TestGnetGenerationFactoryRetainsPartialGeneration(t *testing.T) {
 	dc1 := netip.MustParseAddrPort("192.0.2.1:8888")
 	dc2 := netip.MustParseAddrPort("192.0.2.2:8888")
 	dialer := &generationFactoryTestDialer{failures: map[netip.AddrPort]error{dc2: errors.New("refused")}}
@@ -485,8 +485,20 @@ func TestGnetGenerationFactoryClosesPartialGeneration(t *testing.T) {
 		func(config *GnetGenerationFactoryConfig) { config.DialConcurrency = 1 },
 	)
 	manager, err := factory.Build(t.Context())
-	if manager != nil || !errors.Is(err, ErrGnetGenerationDial) {
+	if manager == nil || err != nil {
 		t.Fatalf("Build = (%v, %v)", manager, err)
+	}
+	if err := manager.Start(t.Context()); err != nil {
+		t.Fatalf("Start partial generation: %v", err)
+	}
+	if got := manager.DCIDs(); !slices.Equal(got, []DCID{1, 2}) {
+		t.Fatalf("partial topology = %v", got)
+	}
+	if _, err := manager.Bind(2); !errors.Is(err, ErrFixedBindingSlotFailed) {
+		t.Fatalf("unavailable signed DC admitted: %v", err)
+	}
+	if err := manager.Close(); err != nil {
+		t.Fatal(err)
 	}
 	links := builder.snapshotLinks()
 	if len(links) != 1 {

@@ -97,6 +97,12 @@ mask-host = "www.google.com"
 # enable-split-tls = true  # Emit first outbound ApplicationData record as 1 byte
 #                          # to defeat passive signatures keyed on the first record.
 
+# Optional Linux TCP pacing for the ServerHello response. Zero disables it.
+# Values 64..1460 limit each paced write to this many TCP payload bytes.
+# This value excludes TCP headers and timestamps. It does not change the MSS.
+# Bulk traffic keeps its negotiated MSS. Other platforms and WEB streams ignore it.
+# server-hello-segment-size = 0
+
 # Native Telegram Desktop WEB proxy (optional, requires Nginx with real TLS).
 # This section has no effect while enabled is false. Changes require a restart.
 [web-proxy]

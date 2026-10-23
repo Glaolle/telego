@@ -68,7 +68,8 @@ type TLSFrontingConfig struct {
 	// in the FakeTLS ServerHello. 0 = auto (match the mask backend's real cert
 	// record size). Set to the backend's first cert-record size to remove the
 	// accept-vs-mask cert-record-length tell.
-	FakeCertSize int `toml:"fake-cert-size"`
+	FakeCertSize           int `toml:"fake-cert-size"`
+	ServerHelloSegmentSize int `toml:"server-hello-segment-size"`
 
 	// MaskSNISafelist: opt-in extra domains an unauthenticated probe may be
 	// fronted to when its ClientHello SNI matches. Empty = off (never a relay).
@@ -226,6 +227,9 @@ func Load(path string) (*Config, error) {
 // validateScalars preserves zero defaults and unlimited settings while rejecting
 // values that would disable limits or fail later in runtime initialization.
 func (c *Config) validateScalars() error {
+	if size := c.TLSFronting.ServerHelloSegmentSize; size != 0 && (size < 64 || size > 1460) {
+		return errors.New("tls-fronting.server-hello-segment-size must be 0 or between 64 and 1460 bytes")
+	}
 	for _, field := range []struct {
 		name  string
 		value int64
@@ -344,6 +348,7 @@ func (c *Config) ToGProxyConfig() (gproxy.Config, error) {
 		cfg.CertPort = cfg.MaskPort
 	}
 	cfg.FakeCertSize = c.TLSFronting.FakeCertSize
+	cfg.ServerHelloSegmentSize = c.TLSFronting.ServerHelloSegmentSize
 	cfg.MaskSNISafelist = c.TLSFronting.MaskSNISafelist
 
 	// Splice target (defaults to mask-host:mask-port if not set)

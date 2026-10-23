@@ -38,6 +38,7 @@ var CLI struct {
 	Run      RunCmd      `cmd:"" help:"Run the proxy server"`
 	Generate GenerateCmd `cmd:"" help:"Generate a new secret"`
 	Version  VersionCmd  `cmd:"" help:"Show version information"`
+	Doctor   DoctorCmd   `cmd:"" help:"Verify the configured TLS fallback certificate"`
 }
 
 // RunCmd runs the proxy server.

@@ -485,6 +485,19 @@ func (h *httpEventHandler) OnTraffic(connection gnet.Conn) gnet.Action {
 		if prepared.kind == requestWebSocket {
 			return h.upgradeWebSocket(connection, state, prepared)
 		}
+		if prepared.kind == requestUp {
+			size, _ := checkedContentLength(prepared.request.contentLength)
+			reservation, err := prepared.session.reserveHTTPUp(prepared.laneID, prepared.sequence, size)
+			if err != nil {
+				if errors.Is(err, ErrBackpressure) {
+					prepared.session.recordBackpressure(carrierOperationUplink)
+					return h.writeImmediate(connection, state, retryResponse())
+				}
+				prepared.session.laneProtocolFailure(prepared.laneID, nil)
+				return h.writeImmediate(connection, state, rejectResponse(400))
+			}
+			prepared.httpUp = reservation
+		}
 		state.pending = prepared
 		state.armDeadline(connection, h.server.config.BodyTimeout)
 	}
@@ -562,6 +575,11 @@ func (s *httpConnectionState) readBody(connection gnet.Conn, bodySize int) bool 
 	data, err := connection.Next(take)
 	if err != nil || len(data) != take {
 		return false
+	}
+	if s.input == nil {
+		// Uplink admission already charged this exact allocation. Avoid
+		// append growth retaining more bytes than the declared body size.
+		s.input = make([]byte, 0, bodySize)
 	}
 	s.input = append(s.input, data...)
 	return true
@@ -719,6 +737,9 @@ func (s *httpConnectionState) close() {
 	cancel := s.cancel
 	lease := s.lease
 	transport := s.websocket
+	pending := s.pending
+	s.pending = nil
+	s.input = nil
 	s.cancel = nil
 	s.lease = nil
 	s.websocket = nil
@@ -731,6 +752,11 @@ func (s *httpConnectionState) close() {
 		cancel()
 	}
 	lease.Release()
+	// A pending body belongs to this connection. Dispatch clears pending
+	// before handing ownership to its worker, which releases after use.
+	if pending != nil {
+		pending.httpUp.Release()
+	}
 	if transport != nil {
 		transport.close()
 	}
@@ -799,6 +825,7 @@ type preparedRequest struct {
 	webSocket          webSocketUpgrade
 	webSocketLane      *WebSocketLaneLease
 	webSocketMultiplex bool
+	httpUp             *httpUpReservation
 }
 
 func (h *httpEventHandler) prepare(
@@ -1160,12 +1187,20 @@ func (h *httpEventHandler) dispatch(
 		operationTimeout = h.server.config.Manager.timeouts.LongPoll + h.server.config.WriteTimeout
 	}
 	if !state.startRequest(connection, cancel, operationTimeout) {
+		request.httpUp.Release()
 		cancel()
 		_ = connection.Close()
 		return
 	}
 	go func() {
-		response := h.serve(ctx, request, body)
+		response := func() carrierResponse {
+			defer func() {
+				// Clear the worker's body before returning its storage charge.
+				body = nil
+				request.httpUp.Release()
+			}()
+			return h.serve(ctx, request, body)
+		}()
 		if ctx.Err() != nil {
 			response.lease.Release()
 			state.finishRequest()
@@ -1272,12 +1307,15 @@ func (h *httpEventHandler) serve(
 			{"X-Session-Token", result.Token},
 			{"X-Carrier-Mode", string(manager.CarrierMode())},
 			{"X-Down-Cursor", "0"},
+			{"X-Up-Window", strconv.Itoa(httpUpWindow)},
 		}, result.Welcome)
 
 	case requestUp:
 		var ack uint64
 		var err error
-		if manager.CarrierMode() == CarrierHTTPSLanes {
+		if request.httpUp != nil {
+			ack, err = request.httpUp.Process(ctx, body)
+		} else if manager.CarrierMode() == CarrierHTTPSLanes {
 			ack, err = request.session.ProcessUpLane(request.laneID, request.sequence, body)
 		} else {
 			ack, err = request.session.ProcessUp(request.sequence, body)

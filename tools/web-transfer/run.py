@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STATE = ROOT / '.local' / 'web-transfer'
 WINDOW = 4 << 20
 MAX_PAYLOAD = 1 << 20
+RESPONSE_DRAIN_TIMEOUT = 1
 
 
 def frame(kind, stream=0, payload=b''):
@@ -80,6 +81,7 @@ class BrowserBridge:
         self.origin = f'https://{parsed.netloc}'
         self.session_url = self.origin + parsed.path + 'api/v1/session'
         self.ready = asyncio.Event()
+        self.session_metadata = asyncio.Event()
         self.condition = asyncio.Condition()
         self.send_lock = asyncio.Lock()
         self.streams = {}
@@ -231,6 +233,7 @@ class BrowserBridge:
             self.tokens.add(token)
             self.stats['sessions_created'] += 1
             self.stats['carrier'] = headers.get('x-carrier-mode')
+            self.session_metadata.set()
 
     def response(self, response):
         task = asyncio.create_task(self.capture_response(response))
@@ -274,11 +277,16 @@ class BrowserBridge:
 
             self.page.on('websocket', socket_opened)
             await self.page.goto(f'http://{self.local_host}/{self.local_token}', timeout=30000)
-            await asyncio.wait_for(self.ready.wait(), 30)
-            if self.failure:
-                raise ConnectionError(self.failure)
-            if self.response_tasks:
-                await asyncio.gather(*list(self.response_tasks))
+            # WELCOME and Playwright response metadata can arrive in either order.
+            async with asyncio.timeout(30):
+                await self.ready.wait()
+                if self.failure:
+                    raise ConnectionError(self.failure)
+                await self.session_metadata.wait()
+                if self.response_tasks:
+                    await asyncio.gather(*list(self.response_tasks))
+                if self.failure:
+                    raise ConnectionError(self.failure)
             if self.stats['carrier'] != self.endpoint['carrier']:
                 raise ValueError('trial carrier changed')
             self.listener = await asyncio.start_server(self.accept, '127.0.0.1', 0)
@@ -311,11 +319,16 @@ class BrowserBridge:
             except Exception:
                 pass
         if self.response_tasks:
-            await asyncio.gather(*list(self.response_tasks), return_exceptions=True)
+            # Give late headers time to provide a token without delaying browser cleanup indefinitely.
+            _, pending = await asyncio.wait(list(self.response_tasks), timeout=RESPONSE_DRAIN_TIMEOUT)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=RESPONSE_DRAIN_TIMEOUT)
         # DELETE is idempotent for recently closed session tokens. This also
         # cleans up when browser startup or its keepalive request failed.
         async with ClientSession(trust_env=False, timeout=ClientTimeout(total=5)) as http:
-            for token in self.tokens:
+            for token in tuple(self.tokens):
                 try:
                     async with http.delete(self.session_url, allow_redirects=False,
                                            headers={'Authorization': 'Bearer ' + token}) as response:
@@ -334,7 +347,23 @@ class BrowserBridge:
             await self.runner.cleanup()
 
 
+def load_payload(mib, payload_file=None):
+    if not 1 <= mib <= 64:
+        raise ValueError('payload size must be 1..64 MiB')
+    size = mib << 20
+    if payload_file is None:
+        return secrets.token_bytes(size)
+    if not payload_file.is_file() or payload_file.stat().st_size != size:
+        raise ValueError('payload file size must match --mib')
+    with payload_file.open('rb') as source:
+        payload = source.read(size + 1)
+    if len(payload) != size:
+        raise ValueError('payload file changed size')
+    return payload
+
+
 async def transfer(args, endpoint, credentials, result):
+    payload = load_payload(args.mib, args.payload_file)
     use_native_ctr()
     bridge = BrowserBridge(endpoint)
     result['bridge'] = bridge.stats
@@ -360,7 +389,6 @@ async def transfer(args, endpoint, credentials, result):
             if user.id != admin:
                 raise ValueError('admin mismatch')
             peer = types.InputPeerUser(user.id, user.access_hash or 0)
-            payload = secrets.token_bytes(args.mib << 20)
             expected = hashlib.sha256(payload).hexdigest()
             name = 'telego-web-transfer-check.bin'
             result['stage'] = 'upload'
@@ -401,6 +429,7 @@ def main():
     parser.add_argument('--endpoint', type=Path, required=True, help='Private endpoint JSON from export_endpoint.py')
     parser.add_argument('--state-dir', type=Path, default=STATE)
     parser.add_argument('--mib', type=int, choices=range(1, 65), default=1, metavar='1..64')
+    parser.add_argument('--payload-file', type=Path, help='Reuse an exact --mib-sized payload file')
     parser.add_argument('--timeout', type=int, choices=range(30, 301), default=120, metavar='30..300')
     parser.add_argument('--send', action='store_true', help='Send the verified document to the configured admin')
     args = parser.parse_args()

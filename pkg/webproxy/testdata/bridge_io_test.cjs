@@ -53,7 +53,8 @@ function harness(carrier, smallBatch = false, diagnostics = true) {
   // Expose existing functions only inside the test VM. Production exports stay unchanged.
   const hooks = `
 globalThis.bridgeTest={request,options,close,createSession,activatePort,poll,pollLane,ensureLane,fail,beginRecovery,deliver,
-  state:()=>({closed,sessionToken,queuedBytes,queuedItems,lanes,downCursor,recovering,epoch,activeStreams,welcomed}),
+  state:()=>({closed,sessionToken,queuedBytes,queuedItems,lanes,downCursor,recovering,epoch,activeStreams,welcomed,downRetainedBytes,downWaiters:downWaiters.size}),
+  queueUp,queueLane,httpUp,setHTTPWindow:value=>{httpWindow=value},
   signal:lifecycleController.signal,
   setSession:()=>{sessionToken='test-token';port=globalThis.testPort},
   ${carrier.startsWith('websocket') ? 'openWebSocket,queueWebSocketLane,' : ''}
@@ -522,7 +523,7 @@ for (const carrier of carriers) {
   test(carrier + ': successful session consumes the bounded welcome response', async () => {
     const h = harness(carrier), welcome = new Uint8Array([17, 0, 0, 0, 0, 0, 0, 0]);
     const response = streamResponse({ chunks: [welcome], headers: { 'X-Carrier-Mode': carrier, 'X-Session-Token': 'issued-token' } });
-    const downlink = streamResponse({ end: false });
+    const downlink = streamResponse({ end: false, headers: { 'X-Down-Cursor': '1' } });
     h.sandbox.respond = async url => url.endsWith('/session') ? response.response : downlink.response;
     h.api.activatePort(h.sandbox.testPort);
     const result = observe(h.api.createSession(new ArrayBuffer(8)));
@@ -926,4 +927,181 @@ test('failure close diagnostic stays within control frame size at numeric limits
   assert.ok(Buffer.byteLength(reason) <= 123);
   assert.equal(JSON.parse(reason).e, 'retry_deadline');
   assertClean(h);
+});
+
+for (const carrier of ['https','https-lanes']) {
+ test(carrier+': conveyor waits for contiguous ACKs before reusing its window',async()=>{
+  const h=harness(carrier,true),acks=new Map();h.api.setSession();h.api.setHTTPWindow(4);
+  h.sandbox.respond=(url,options)=>{
+   if(url.endsWith('/api/v1/down'))return parked(options);
+   return new Promise(resolve=>acks.set(options.headers['X-Up-Seq'],()=>resolve(new Response(null,{status:204,headers:{'X-Up-Ack':options.headers['X-Up-Seq']}}))));
+  };
+  const enqueue=()=>carrier==='https'?h.api.queueUp(streamFrame(1)):h.api.queueLane({type:1,id:1,data:streamFrame(1)});
+  for(let i=0;i<5;i++)enqueue();await flush();
+  assert.deepEqual([...acks.keys()],['1','2','3','4']);
+  for(const key of ['2','3','4'])acks.get(key)();await flush();
+  assert.deepEqual([...acks.keys()],['1','2','3','4'],'lost ACK 1 must prevent sequence 5');
+  acks.get('1')();await flush();assert.equal(acks.has('5'),true);
+  acks.get('5')();await flush();assert.equal(h.api.state().queuedBytes,0);
+  h.pagehide();await flush();assertClean(h);
+ });
+}
+
+test('legacy session keeps one HTTP uplink in flight',async()=>{
+ const h=harness('https'),acks=[];h.api.setSession();
+ h.sandbox.respond=(url,options)=>new Promise(resolve=>acks.push(()=>resolve(new Response(null,{status:204,headers:{'X-Up-Ack':options.headers['X-Up-Seq']}}))));
+ h.api.queueUp(streamFrame(1));h.api.queueUp(streamFrame(2));await flush();assert.equal(acks.length,1);
+ acks[0]();await flush();assert.equal(acks.length,2);acks[1]();await flush();h.pagehide();assertClean(h);
+});
+
+test('HTTP uplink sequence exhaustion cannot wrap',async()=>{
+ const h=harness('https');h.api.setSession();h.api.setHTTPWindow(4);
+ h.api.httpUp.sequence=18446744073709551615n;h.api.httpUp.frontier=18446744073709551614n;
+ h.sandbox.respond=async(url,options)=>new Response(null,{status:204,headers:{'X-Up-Ack':options.headers['X-Up-Seq']}});
+ h.api.queueUp(streamFrame(1));await flush();h.api.queueUp(streamFrame(2));await flush();
+ const up=h.requests.filter(request=>request.url.endsWith('/api/v1/up'));assert.equal(up.length,1);
+ assert.equal(up[0].options.headers['X-Up-Seq'],'18446744073709551615');assert.equal(h.api.state().closed,true);assertClean(h);
+});
+
+for (const carrier of ['https','https-lanes']) {
+ for (const changed of [false,true]) {
+  test(carrier+': partial downlink replay '+(changed?'rejects a changed prefix':'delivers each frame once'),async()=>{
+   const h=harness(carrier),first=streamResponse({end:false,headers:{'X-Down-Cursor':'1'}}),one=dataFrame(1),two=dataFrame(1,2);
+   let calls=0;h.api.setSession();const lane=carrier==='https-lanes'?h.api.ensureLane(1):null;
+   h.sandbox.respond=async(url,options)=>{
+    if(++calls===1)return first.response;
+    if(calls===2){const prefix=one.slice();if(changed)prefix[prefix.length-1]^=1;return streamResponse({headers:{'X-Down-Cursor':'1'},chunks:[prefix,two]}).response}
+    return parked(options);
+   };
+   const pending=observe(lane?h.api.pollLane(lane):h.api.poll());await flush();
+   first.controller.enqueue(one);await flush();
+   assert.equal(h.messages.filter(value=>value instanceof ArrayBuffer).length,1,'first frame arrives before response EOF');
+   assert.equal(lane?lane.cursor:h.api.state().downCursor,'0');
+   first.controller.error(new TypeError('network lost'));await flush();await h.advance(500);await flush();
+   if(changed){assert.equal(h.api.state().closed,true);assert.equal(h.messages.filter(value=>value instanceof ArrayBuffer).length,1)}
+   else{
+    assert.equal(lane?lane.cursor:h.api.state().downCursor,'1');
+    const frames=h.messages.filter(value=>value instanceof ArrayBuffer);assert.equal(frames.length,2);
+    assert.deepEqual(new Uint8Array(frames[0]),one);assert.deepEqual(new Uint8Array(frames[1]),two);
+   }
+   h.pagehide();await pending.done;assert.equal(h.api.state().downRetainedBytes,0);assertClean(h);
+  });
+ }
+}
+
+test('concurrent downlinks share a bounded replay budget and shutdown releases every reader',async()=>{
+ const h=harness('https-lanes'),responses=[],pending=[];h.api.setSession();
+ h.sandbox.respond=async()=>{const response=streamResponse({end:false,headers:{'X-Down-Cursor':'1'}});responses.push(response);return response.response};
+ for(let id=1;id<=17;id++)pending.push(observe(h.api.pollLane(h.api.ensureLane(id))));
+ await flush();assert.equal(h.api.state().downRetainedBytes,33554432);assert.equal(h.api.state().downWaiters,1);
+ h.pagehide();await Promise.all(pending.map(result=>result.done));
+ assert.equal(h.api.state().downRetainedBytes,0);assert.equal(h.api.state().downWaiters,0);
+ for(const response of responses){assert.equal(response.cancelled(),true);assert.equal(response.body.locked,false)}
+ assertClean(h);
+});
+
+for(const carrier of ['https','https-lanes']){
+ for(const changed of ['cursor','length']){
+  test(carrier+': partial replay rejects changed '+changed,async()=>{
+   const h=harness(carrier),frame=dataFrame(1),headers={'X-Down-Cursor':'1','Content-Length':String(frame.byteLength*2)};
+   const first=streamResponse({end:false,headers});let calls=0;
+   h.api.setSession();const lane=carrier==='https-lanes'?h.api.ensureLane(1):null;
+   h.sandbox.respond=async()=>{
+    if(++calls===1)return first.response;
+    const replayHeaders={...headers};if(changed==='cursor')replayHeaders['X-Down-Cursor']='2';else replayHeaders['Content-Length']=String(frame.byteLength*2+1);
+    return streamResponse({headers:replayHeaders,chunks:[frame,frame]}).response;
+   };
+   const pending=observe(lane?h.api.pollLane(lane):h.api.poll());await flush();first.controller.enqueue(frame);await flush();
+   first.controller.error(new TypeError('network lost'));await flush();await h.advance(500);await pending.done;
+   assert.equal(h.api.state().closed,true);assert.equal(h.messages.filter(value=>value instanceof ArrayBuffer).length,1);
+   assert.equal(h.api.state().downRetainedBytes,0);assertClean(h);
+  });
+ }
+ test(carrier+': incomplete final frame never advances the response cursor',async()=>{
+  const h=harness(carrier),frame=dataFrame(1);h.api.setSession();const lane=carrier==='https-lanes'?h.api.ensureLane(1):null;
+  h.sandbox.respond=async()=>streamResponse({headers:{'X-Down-Cursor':'1'},chunks:[frame,new Uint8Array([2])]}).response;
+  await (lane?h.api.pollLane(lane):h.api.poll());
+  assert.equal(h.api.state().closed,true);assert.equal(lane?lane.cursor:h.api.state().downCursor,'0');
+  assert.equal(h.messages.filter(value=>value instanceof ArrayBuffer).length,1);assert.equal(h.api.state().downRetainedBytes,0);assertClean(h);
+ });
+}
+
+async function retiredHTTPLane(types=[1,2,3],firstAck='1') {
+ const h=await liveBridge('https-lanes'),settlers=new Map();h.api.setHTTPWindow(4);
+ const original=h.sandbox.respond;let closeDown;h.failLateNetwork=false;
+ h.sandbox.respond=(url,options)=>{
+  if(options.headers['X-Lane-ID']!=='1')return original(url,options);
+  if(url.endsWith('/api/v1/down'))return new Promise(resolve=>{closeDown=()=>resolve(new Response(null,{status:204,headers:{'X-Lane-Closed':'1','X-Down-Cursor':'0'}}))});
+  if(h.failLateNetwork&&options.headers['X-Up-Seq']==='2')return Promise.reject(new TypeError('network unavailable'));
+  return new Promise((resolve,reject)=>settlers.set(options.headers['X-Up-Seq'],{resolve,reject}));
+ };
+ // A second native stream must remain usable after the first stream retires.
+ nativeFrame(h,2);await flush();
+ for(const type of types)nativeFrame(h,1,type);
+ await flush();const lane=h.api.state().lanes.get(1),epoch=h.api.state().epoch;
+ const ack=(key,value=key)=>settlers.get(key).resolve(new Response(null,{status:204,headers:{'X-Up-Ack':value}}));
+ ack(firstAck);await flush();assert.equal(typeof closeDown,'function');closeDown();await flush();
+ assert.equal(h.api.state().lanes.has(1),false);
+ return {h,lane,epoch,settlers,ack};
+}
+
+for(const outcome of ['success','invalid_ack','http_error','network_error']) {
+ test('retired HTTPS lane refunds settled uplinks once and ignores late '+outcome,async()=>{
+  const {h,lane,epoch,settlers,ack}=await retiredHTTPLane();
+  assert.equal(h.api.state().queuedBytes,17);assert.equal(h.api.state().queuedItems,2);
+  assert.equal(lane.upState.active.size,2,'retirement retains active request ownership');
+  const batches=[...lane.upState.active.values()];
+  if(outcome==='success')ack('2');
+  else if(outcome==='invalid_ack')ack('2','invalid');
+  else if(outcome==='http_error')settlers.get('2').resolve(new Response(null,{status:400}));
+  else {
+   h.failLateNetwork=true;settlers.get('2').reject(new TypeError('network unavailable'));await flush();
+   for(let attempt=0;attempt<8;attempt++)await h.advance(10000);
+   const attempts=h.requests.filter(request=>request.url.endsWith('/api/v1/up')&&request.options.headers['X-Lane-ID']==='1'&&request.options.headers['X-Up-Seq']==='2');
+   assert.equal(attempts.length,9,'the original bounded retry operation reaches its failure path');
+  }
+  await flush();assert.equal(h.api.state().queuedBytes,8);assert.equal(h.api.state().queuedItems,1);
+  ack('3');await flush();
+  assert.equal(h.api.state().queuedBytes,0);assert.equal(h.api.state().queuedItems,0);
+  assert.equal(lane.upState.active.size,0);for(const batch of batches)assert.equal(batch.body,null);
+  assert.equal(h.api.state().closed,false);assert.equal(h.api.state().recovering,false);assert.equal(h.api.state().epoch,epoch);
+  assert.equal(h.api.state().lanes.has(2),true);assert.equal(h.api.state().activeStreams.has(2),true);
+  assert.equal(h.requests.some(request=>request.url.includes('/?bridge=')),false,'retired failure must not replace the healthy session');
+  h.pagehide();await flush();assertClean(h);
+ });
+}
+
+test('retiring an HTTPS lane refunds pending data while active bodies remain charged',async()=>{
+ const {h,lane,ack}=await retiredHTTPLane([1,2,2,2,3],'4');
+ assert.equal(lane.pending.length,0);assert.equal(lane.upState.active.size,3);
+ assert.equal(h.api.state().queuedBytes,26);assert.equal(h.api.state().queuedItems,3);
+ for(const key of ['1','2','3'])ack(key);await flush();
+ assert.equal(h.api.state().queuedBytes,0);assert.equal(h.api.state().queuedItems,0);assert.equal(lane.upState.active.size,0);
+ h.pagehide();await flush();assertClean(h);
+});
+
+for(const settleFirst of [false,true]) {
+ test('page closure cannot refund retired request ownership twice; first ACK settled='+settleFirst,async()=>{
+  const {h,lane,settlers,ack}=await retiredHTTPLane();const batches=[...lane.upState.active.values()];
+  if(settleFirst){ack('2');await flush();assert.equal(h.api.state().queuedBytes,8);assert.equal(h.api.state().queuedItems,1)}
+  h.pagehide();await flush();assert.equal(h.api.state().queuedBytes,0);assert.equal(h.api.state().queuedItems,0);
+  ack('2');settlers.get('3').reject(new TypeError('network unavailable'));await flush();
+  assert.equal(h.api.state().queuedBytes,0);assert.equal(h.api.state().queuedItems,0);assert.equal(lane.upState.active.size,0);
+  for(const batch of batches)assert.equal(batch.body,null);
+  assertClean(h);
+ });
+}
+
+test('a retired epoch cannot release a replacement batch that reuses its sequence',async()=>{
+ const h=await liveBridge('https'),requests=[],original=h.sandbox.respond;
+ h.sandbox.respond=(url,options)=>url.endsWith('/api/v1/up')?new Promise(resolve=>requests.push({resolve,options})):original(url,options);
+ nativeFrame(h,1);await flush();const oldBatch=h.api.httpUp.active.get('1');assert.ok(oldBatch);
+ h.api.beginRecovery();await flush();assert.equal(h.api.state().recovering,false);
+ nativeFrame(h,2);await flush();const replacement=h.api.httpUp.active.get('1');assert.ok(replacement);assert.notEqual(replacement,oldBatch);
+ requests[0].resolve(new Response(null,{status:204,headers:{'X-Up-Ack':'1'}}));await flush();
+ assert.equal(oldBatch.body,null);assert.equal(h.api.httpUp.active.get('1'),replacement);
+ assert.equal(h.api.state().queuedBytes,8);assert.equal(h.api.state().queuedItems,1);assert.equal(h.api.state().closed,false);
+ requests[1].resolve(new Response(null,{status:204,headers:{'X-Up-Ack':'1'}}));await flush();
+ assert.equal(h.api.state().queuedBytes,0);assert.equal(h.api.state().queuedItems,0);assert.equal(h.api.httpUp.active.size,0);
+ h.pagehide();await flush();assertClean(h);
 });

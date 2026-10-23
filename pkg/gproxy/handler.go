@@ -421,6 +421,11 @@ func (h *ProxyHandler) clientTraffic(c clientEndpoint, ctx *ConnContext) gnet.Ac
 		return h.handleTLSHeader(c, ctx)
 	case StateReadTLSPayload:
 		return h.handleTLSPayload(c, ctx)
+	case StateWriteServerHello:
+		if c.InboundBuffered() > h.maxWriteBuffer {
+			return h.failHandshake(ctx, handshakeFailureTLSServerHello)
+		}
+		return gnet.None
 	case StateReadO2Frame:
 		return h.handleO2Frame(c, ctx)
 	case StateReadDDFrame:

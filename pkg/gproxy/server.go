@@ -52,6 +52,8 @@ type Config struct {
 	// ApplicationData record in the FakeTLS ServerHello. 0 = auto (match the mask
 	// backend's real first cert-record size, falling back to random padding).
 	FakeCertSize int
+	// ServerHelloSegmentSize paces Linux TCP handshake writes. Zero disables it.
+	ServerHelloSegmentSize int
 
 	// MaskSNISafelist is an opt-in list of extra domains that an unauthenticated
 	// probe may be fronted to. When a bad-secret ClientHello's SNI is on this

@@ -100,6 +100,7 @@ func renderBridgeAtPath(hostname, bootstrapToken string, batchBytes int, carrier
 	carrierJSON, _ := json.Marshal(carrier)
 	body := strings.NewReplacer(
 		"__RECOVERY__", bridgeRecoveryScript,
+		"__HTTPS__", bridgeHTTPSScript,
 		"__NONCE__", nonce,
 		"__ORIGIN__", string(originJSON),
 		"__BOOTSTRAP__", string(tokenJSON),
@@ -241,13 +242,13 @@ function release(bytes,items,lane){queuedBytes-=bytes;queuedItems-=items;if(lane
 		{"function deleteSession(){", webSocketBridgeFunctions + "\nfunction deleteSession(){"},
 		{
 			`function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
+ if(closed)return;closed=true;resetHTTPS();lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
  for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
  if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
  for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();
 }`,
 			`function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
+ if(closed)return;closed=true;resetHTTPS();lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
  for(const lane of lanes.values()){
   if(lane.controller)lane.controller.abort();if(lane.timer)clearTimeout(lane.timer);
   if(lane.socket)try{lane.socket.close()}catch(error){}
@@ -426,6 +427,7 @@ const lifecycleController=new AbortController();
 const beforeSession=[],upPending=[];
 const lanes=new Map(),closedLanes=new Set(),closedLaneOrder=[];
 __RECOVERY__
+__HTTPS__
 const status=state=>{if(port&&!closed)port.postMessage({t:'status',state})};
 function ensureOpen(external){if(closed||lifecycleController.signal.aborted||(external&&external.aborted))throw new DOMException('carrier closed','AbortError')}
 function pause(milliseconds,external){
@@ -520,7 +522,7 @@ async function readResponse(response,limit,exact,signal,deadline){
  }catch(error){cancel();throw error}
  finally{signal.removeEventListener('abort',cancel);reader.releaseLock()}
 }
-async function request(path,makeOptions,onHeaders){
+async function request(path,makeOptions,onHeaders,onBody){
  let delay=250,attempt=0;const started=Date.now(),deadline=started+(recovering?recoveryRemaining():requestTimeoutMs),generation=epoch,retired=epochController.signal;
  while(true){
   ensureOpen(retired);const requestOptions=makeOptions(),controller=new AbortController(),external=requestOptions.signal;
@@ -536,7 +538,9 @@ async function request(path,makeOptions,onHeaders){
     ensureOpen(controller.signal);
     if(Date.now()>=deadline)throw new Error('response deadline reached');
     let body=new ArrayBuffer(0);
-    if(response.status===200&&path.startsWith('/?bridge=')){
+    if(response.status===200&&onBody){
+ body=await onBody(response,controller.signal,deadline);
+ }else if(response.status===200&&path.startsWith('/?bridge=')){
      body=await readResponse(response,1024,false,controller.signal,deadline);
     }else if(response.status===200&&(path==='/api/v1/session'||path==='/api/v1/down')){
      // The server can send one whole frame above the configured batch target.
@@ -546,7 +550,7 @@ async function request(path,makeOptions,onHeaders){
     return {status:response.status,headers:response.headers,body};
    }
    unavailable=true;retry=retryAfterMs(response);cancelResponse(response);
-  }catch(error){controller.abort();cancelResponse(response);ensureOpen(retired);ensureOpen(external);if(response){if(error.name==='AbortError'||error.name==='TypeError'||error.message==='response deadline reached')error.recoverable=true;throw diagnosticException(error,{httpStatus:response.status,operationMS:Date.now()-started})};if(++attempt===9)throw transportError('carrier retry limit reached')}
+  }catch(error){controller.abort();cancelResponse(response);ensureOpen(retired);ensureOpen(external);if(response){if(error.name==='AbortError'||error.name==='TypeError'||error.message==='response deadline reached')error.recoverable=true;if(!onBody||!error.recoverable)throw diagnosticException(error,{httpStatus:response.status,operationMS:Date.now()-started})}if(++attempt===9)throw transportError('carrier retry limit reached')}
   finally{clearTimeout(timer);lifecycleController.signal.removeEventListener('abort',abort);retired.removeEventListener('abort',abort);if(external)external.removeEventListener('abort',abort)}
   ensureOpen(retired);ensureOpen(external);const backoffRemaining=deadline-Date.now();if(backoffRemaining<=0)throw transportError('carrier retry deadline reached');
   status('reconnecting');const backoff=Math.min(retry||(delay+Math.floor(Math.random()*Math.max(1,delay/4))),backoffRemaining);await pause(backoff,external);if(!unavailable||recovering)delay=Math.min(delay*2,recovering?2000:5000);
@@ -611,6 +615,8 @@ async function createSession(first,replacement=false){
    if(response.headers.get('X-Carrier-Mode')!==carrier)throw new Error('session creation rejected');
    // Retain the cleanup token even if the body stalls or the page closes.
    sessionToken=response.headers.get('X-Session-Token')||'';downCursor=response.headers.get('X-Down-Cursor')||'0';
+ const window=response.headers.get('X-Up-Window');httpWindow=window===null?1:Number(window);
+ if(httpWindow!==1&&httpWindow!==4)throw new Error('invalid session creation');
    if(closed)deleteSession();
   });
   const welcome=response.body;
@@ -629,35 +635,8 @@ function queueUp(data){
  try{splitFrames(data)}catch(error){fail('up_frames',error);return}
  if(!reserve(data)){fail('up_capacity');return}upPending.push(data);runUp();
 }
-async function runUp(){
- if(upRunning)return;upRunning=true;
- const generation=epoch;
- try{
-  while(!closed&&sessionToken&&upPending.length){
-   const batch=joinPending(upPending),sequence=String(upSequence);
-   const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence}));
-   if(!current(generation))return;
-   if(response.status!==204)throw diagnosticException(transportError('uplink rejected'),{httpStatus:response.status});
-   if(response.headers.get('X-Up-Ack')!==sequence)throw new Error('uplink rejected');
-   release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});upSequence++;
-  }
- }catch(error){if(current(generation))fail('up_send',error)}finally{if(current(generation)){upRunning=false;if(sessionToken&&upPending.length)runUp()}}
-}
-async function poll(){
- const generation=epoch;
- while(current(generation)&&sessionToken){
-  try{
-   pollController=new AbortController();
-   const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':downCursor},pollController.signal));
-   if(!current(generation))return;
-   if(response.status===204){status('connected');continue}
-   if(response.status!==200)throw diagnosticException(transportError('downlink rejected'),{httpStatus:response.status});
-   const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
-   if(!next||!frames.length)throw new Error('invalid downlink response');
-   deliver(data);downCursor=next;status('connected');
-  }catch(error){if(current(generation))fail('down_poll',error);return}
- }
-}
+function runUp(){launchHTTPUp(httpUp,upPending,null)}
+function poll(){return pollHTTPS(null)}
 function ensureLane(id){
  let lane=lanes.get(id);
  if(!lane){lane={id,sequence:1,cursor:'0',pending:[],running:false,polling:false,controller:null};lanes.set(id,lane)}
@@ -670,6 +649,7 @@ function rememberLaneClosed(id){
 }
 function finishLane(lane){
  if(!lane||lanes.get(lane.id)!==lane)return;
+ releaseDown(lane.downState);
  for(const data of lane.pending)release(data.byteLength,1);
  lane.pending.length=0;lanes.delete(lane.id);rememberLaneClosed(lane.id);
  activeStreams.delete(lane.id);
@@ -683,41 +663,11 @@ function queueLane(frame){
  if(!reserve(frame.data)){fail('lane_capacity',null,frame.id);return}
  lane.pending.push(frame.data);runLaneUp(lane);
 }
-async function runLaneUp(lane){
- if(lane.running)return;lane.running=true;
- const generation=epoch;
- try{
-  while(!closed&&sessionToken&&lane.pending.length){
-   const batch=joinPending(lane.pending),sequence=String(lane.sequence),laneID=String(lane.id);
-   const response=await request('/api/v1/up',()=>options('POST',sessionToken,batch.body,{'X-Up-Seq':sequence,'X-Lane-ID':laneID}));
-   if(!current(generation))return;
-   if(response.status!==204)throw diagnosticException(transportError('lane uplink rejected'),{httpStatus:response.status});
-   if(response.headers.get('X-Up-Ack')!==sequence)throw new Error('lane uplink rejected');
-   release(batch.total,batch.count);port.postMessage({t:'traffic',up:batch.total,down:0});lane.sequence++;
-   if(!lane.polling)pollLane(lane);
-  }
- }catch(error){if(current(generation))fail('lane_up',error,lane.id)}finally{lane.running=false;if(current(generation)&&sessionToken&&lane.pending.length)runLaneUp(lane)}
-}
-async function pollLane(lane){
- if(!lane||lane.polling)return;lane.polling=true;
- const generation=epoch;
- try{
-  while(!closed&&sessionToken&&lanes.get(lane.id)===lane){
-   const controller=new AbortController(),laneID=String(lane.id);lane.controller=controller;
-   const response=await request('/api/v1/down',()=>options('POST',sessionToken,null,{'X-Down-Cursor':lane.cursor,'X-Lane-ID':laneID},controller.signal));
-   if(!current(generation))return;
-   if(response.status===204){if(response.headers.get('X-Lane-Closed')==='1'){finishLane(lane);return}status('connected');continue}
-   if(response.status!==200)throw diagnosticException(transportError('lane downlink rejected'),{httpStatus:response.status});
-   const next=response.headers.get('X-Down-Cursor')||'',data=response.body,frames=splitFrames(data);
-   if(!next||!frames.length)throw new Error('invalid lane downlink response');
-   for(const frame of frames)if(frame.id!==lane.id)throw new Error('cross-lane frame');
-   deliver(data);lane.cursor=next;status('connected');
-  }
- }catch(error){if(current(generation))fail('lane_down',error,lane.id)}finally{lane.polling=false;lane.controller=null}
-}
+function runLaneUp(lane){if(!lane.upState)lane.upState=newHTTPUp();launchHTTPUp(lane.upState,lane.pending,lane)}
+function pollLane(lane){return pollHTTPS(lane)}
 function deleteSession(){if(sessionToken)fetch(relayOrigin+'/api/v1/session',options('DELETE',sessionToken,null,null,undefined,true)).then(cancelResponse).catch(()=>{})}
 function close(notifyServer){
- if(closed)return;closed=true;lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
+ if(closed)return;closed=true;resetHTTPS();lifecycleController.abort();epochController.abort();if(recoveryTimer)clearTimeout(recoveryTimer);if(pollController)pollController.abort();
  for(const lane of lanes.values())if(lane.controller)lane.controller.abort();
  if(notifyServer)deleteSession();beforeSession.length=0;upPending.length=0;
  for(const lane of lanes.values())lane.pending.length=0;lanes.clear();queuedBytes=0;queuedItems=0;if(port)port.close();

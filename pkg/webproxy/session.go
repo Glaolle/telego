@@ -88,6 +88,7 @@ type carrierLane struct {
 	downCursor      uint64
 	lastUpSequence  uint64
 	lastUpDigest    [sha256.Size]byte
+	upHistory       [httpUpWindow]upCommit
 	upActive        bool
 	downActive      bool
 	websocketActive bool
@@ -134,6 +135,9 @@ type Session struct {
 	tombstones      boundedSet[uint32]
 	carrierLanes    map[uint32]*carrierLane
 	websocketActive bool
+	httpUpLanes     map[uint32]*httpUpLane
+	httpInputCost   int
+	httpInputItems  int
 	pendingCost     int
 	pendingItems    int
 	closed          bool
@@ -335,7 +339,7 @@ func (l *WebSocketLaneLease) ProcessUp(sequence uint64, body []byte) (uint64, er
 	if l == nil || l.session == nil || l.lane == nil {
 		return 0, ErrClosed
 	}
-	return l.session.processUp(l.laneID, sequence, body, true, l.lane)
+	return l.session.processUp(l.laneID, sequence, body, true, l.lane, nil)
 }
 
 // Poll acknowledges and polls downlink through this acquired lane.
@@ -399,7 +403,7 @@ func (s *Session) ProcessUp(sequence uint64, body []byte) (uint64, error) {
 	if s.carrier.usesLanes() {
 		return 0, ErrProtocol
 	}
-	return s.processUp(0, sequence, body, false, nil)
+	return s.processUp(0, sequence, body, false, nil, nil)
 }
 
 // ProcessUpLane applies one uplink batch to an independent stream lane.
@@ -407,7 +411,7 @@ func (s *Session) ProcessUpLane(laneID uint32, sequence uint64, body []byte) (ui
 	if s.carrier != CarrierHTTPSLanes || laneID > MaxStreamID {
 		return 0, ErrProtocol
 	}
-	return s.processUp(laneID, sequence, body, true, nil)
+	return s.processUp(laneID, sequence, body, true, nil, nil)
 }
 
 func (s *Session) processUp(
@@ -416,6 +420,7 @@ func (s *Session) processUp(
 	body []byte,
 	lanes bool,
 	expected *carrierLane,
+	prepaid *httpUpReservation,
 ) (uint64, error) {
 	digest := sha256.Sum256(body)
 	s.mu.Lock()
@@ -492,8 +497,12 @@ func (s *Session) processUp(
 		return 0, ErrProtocol
 	}
 	reservedCost, reservedItems, ok := s.backendWriteReservationLocked(frames)
-	if !ok || ((reservedCost != 0 || reservedItems != 0) &&
-		!s.reservePendingLocked(reservedCost, reservedItems, pendingUplink)) {
+	if ok && prepaid != nil {
+		ok = prepaid.transferApplicationLocked(reservedCost, reservedItems)
+	} else if ok && (reservedCost != 0 || reservedItems != 0) {
+		ok = s.reservePendingLocked(reservedCost, reservedItems, pendingUplink)
+	}
+	if !ok {
 		s.mu.Unlock()
 		s.recordBackpressure(carrierOperationUplink)
 		return 0, ErrBackpressure
@@ -510,6 +519,7 @@ func (s *Session) processUp(
 	if applied {
 		lane.lastUpSequence = sequence
 		lane.lastUpDigest = digest
+		lane.upHistory[sequence%httpUpWindow] = upCommit{sequence: sequence, digest: digest}
 	}
 	s.mu.Unlock()
 
@@ -1429,6 +1439,9 @@ func (s *Session) releaseCarrierLaneLocked(laneID uint32) {
 	if lane == nil {
 		return
 	}
+	if conveyor := s.httpUpLanes[laneID]; conveyor != nil {
+		conveyor.signal()
+	}
 	delete(s.carrierLanes, laneID)
 	cost := lane.unackedCost
 	items := lane.unackedItems
@@ -1492,9 +1505,9 @@ func (s *Session) closeLocked(reason sessionCloseReason) []*backendStream {
 		backends = append(backends, state.backend)
 	}
 	s.streams = nil
-	// Owner backends retain their queue charges until OnClosed confirms the
-	// actual storage has been released. Other sessions cannot reuse them early.
-	retainedCost, retainedItems := 0, 0
+	// Owner backends and HTTP handlers retain charges until they release the
+	// actual storage. Other sessions cannot reuse their capacity early.
+	retainedCost, retainedItems := s.httpInputCost, s.httpInputItems
 	for backend := range s.backends {
 		retainedCost += backend.inputCost + backend.outputCost
 		retainedItems += backend.inputItems + backend.outputItems
